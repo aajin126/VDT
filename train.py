@@ -248,7 +248,7 @@ def evaluate(ema, ae, cond_encoder, diffusion, args, device, rank, epoch, logger
 
     # Encode future
     posterior_future = ae.encode(future_maps)
-    future_latents = posterior_future.mode()
+    future_latents = posterior_future.mode().mul_(args.scale_factor)
 
     lat_c = future_latents.shape[1]
 
@@ -289,7 +289,7 @@ def log_images(ema, ae, cond_encoder, diffusion, args, device, rank, train_steps
 
     # Encode future
     posterior_future = ae.encode(future_maps)
-    future_latents = posterior_future.mode()  # (B, T, lat_c, lat_h, lat_w)
+    future_latents = posterior_future.mode().mul_(args.scale_factor)  # (B, T, lat_c, lat_h, lat_w)
     
     lat_c = future_latents.shape[1]
     
@@ -311,6 +311,7 @@ def log_images(ema, ae, cond_encoder, diffusion, args, device, rank, train_steps
     )
     samples = samples.permute(1, 2, 0, 3, 4)  # (B, T, lat_c, lat_h, lat_w)
     samples_flat = samples.reshape(-1, lat_c, latent_size, latent_size)
+    samples_flat = 1. / args.scale_factor * samples_flat 
 
     # Decode
     decoded = ae.decode(samples_flat)
@@ -468,7 +469,7 @@ def main(args):
             with torch.no_grad():
                 # Encode future frames for diffusion
                 posterior_future = ae.encode(future_maps)
-                future_latents = posterior_future.mode()  # (B, T, lat_c, lat_h, lat_w)
+                future_latents = posterior_future.mode().mul_(args.scale_factor)  # (B, T, lat_c, lat_h, lat_w)
 
             lat_c = future_latents.shape[1]
             lat_h = future_latents.shape[2]
@@ -557,6 +558,7 @@ if __name__ == "__main__":
                         help="Path to test dataset. Defaults to --data-path if not set.")
     parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--eval-sampling-steps", type=int, default=10)
+    parser.add_argument("--scale-factor", type=float, default=0.374106)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--ckpt-every", type=int, default=5000)
     args = parser.parse_args()
