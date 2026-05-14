@@ -33,9 +33,9 @@ from tqdm import tqdm
 
 from models.models import VDT_models
 from models.diffusion import create_diffusion
-from models.mask_generator import VideoMaskGenerator
 from preprocessing.dataloader import PredOccDataset
 from preprocessing.data_preprocessing import preprocess_batch
+from models.convlstm import ConvLSTMCell
 from omegaconf import OmegaConf
 from utils.util import instantiate_from_config 
 
@@ -47,6 +47,122 @@ def make_video(batch_out):
     mask_binary_maps   = batch_out["mask_binary_maps"].float()    # (B, T, 1, H, W) - future
 
     return torch.cat([input_binary_maps, mask_binary_maps], dim=1)  # (B, 2T, 1, H, W)
+
+
+class Residual(nn.Module):
+    def __init__(self, in_channels, num_hiddens, num_residual_hiddens):
+        super(Residual, self).__init__()
+        self._block = nn.Sequential(
+            nn.ReLU(),
+            nn.Conv2d(in_channels=in_channels,
+                      out_channels=num_residual_hiddens,
+                      kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(num_residual_hiddens),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=num_residual_hiddens,
+                      out_channels=num_hiddens,
+                      kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(num_hiddens)
+        )
+    
+    def forward(self, x):
+        return x + self._block(x)
+
+class ResidualStack(nn.Module):
+    def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens):
+        super(ResidualStack, self).__init__()
+        self._num_residual_layers = num_residual_layers
+        self._layers = nn.ModuleList([Residual(in_channels, num_hiddens, num_residual_hiddens)
+                             for _ in range(self._num_residual_layers)])
+
+    def forward(self, x):
+        for i in range(self._num_residual_layers):
+            x = self._layers[i](x)
+        return F.relu(x)
+
+class Encoder(nn.Module):
+    def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens):
+        super(Encoder, self).__init__()
+        self._conv_1 = nn.Sequential(*[
+                                        nn.Conv2d(in_channels=in_channels,
+                                                  out_channels=num_hiddens//2,
+                                                  kernel_size=4,
+                                                  stride=2, 
+                                                  padding=1),
+                                        nn.BatchNorm2d(num_hiddens//2),
+                                        nn.ReLU()
+                                    ])
+        self._conv_2 = nn.Sequential(*[
+                                        nn.Conv2d(in_channels=num_hiddens//2,
+                                                  out_channels=num_hiddens,
+                                                  kernel_size=4,
+                                                  stride=2, 
+                                                  padding=1),
+                                        nn.BatchNorm2d(num_hiddens)
+                                        #nn.ReLU()
+                                    ])
+        self._residual_stack = ResidualStack(in_channels=num_hiddens,
+                                             num_hiddens=num_hiddens,
+                                             num_residual_layers=num_residual_layers,
+                                             num_residual_hiddens=num_residual_hiddens)
+
+    def forward(self, inputs):
+        x = self._conv_1(inputs)
+        x = self._conv_2(x)
+        x = self._residual_stack(x)
+        return x 
+
+
+class CondEncoder(nn.Module):
+    """Compress past latent sequence into spatial conditioning map using ConvLSTM."""
+    
+    def __init__(self, input_dim=1, hidden_dim=32):
+        super().__init__()
+        self.convlstm = ConvLSTMCell(input_dim, hidden_dim, kernel_size=(3, 3), bias=True)
+        
+        # Use Encoder class for better feature extraction
+        self.encoder = Encoder(
+            in_channels=33,
+            num_hiddens=128,
+            num_residual_layers=2,
+            num_residual_hiddens=64
+        )
+        
+        # Final projection: (128, 16, 16) → (32, 16, 16)
+        self.cond_proj = nn.Conv2d(128, hidden_dim, kernel_size=1)
+    
+    def forward(self, past_latents, input_occ_grid=None):
+        """
+        Args:
+            past_latents: (B, T, 1, H, W) - past binary maps (original image size)
+            input_occ_grid: (B, 1, H, W) - input occupancy grid map
+        Returns:
+            cond: (B, 32, 16, 16) - conditioning feature map
+        """
+        B, T, C, H, W = past_latents.shape
+        
+        # Initialize ConvLSTM hidden state at original image size
+        h_enc, c_enc = self.convlstm.init_hidden(B, (H, W))
+        
+        # Process past frames through ConvLSTM
+        for t in range(T):
+            frame = past_latents[:, t]  # (B, 1, H, W)
+            h_enc, c_enc = self.convlstm(frame, (h_enc, c_enc))
+        
+        # h_enc: (B, hidden_dim, H, W) = (B, 32, 64, 64)
+        # Combine with input occupancy grid
+        if input_occ_grid is not None:
+            cond_in = torch.cat([h_enc, input_occ_grid], dim=1)  # (B, 33, H, W)
+        else:
+            cond_in = h_enc  # (B, 32, H, W)
+        
+        # Encoder: downsample to latent space size
+        cond_feat = self.encoder(cond_in)  # (B, 128, 16, 16)
+        
+        # Final projection
+        cond = self.cond_proj(cond_feat)  # (B, 32, 16, 16)
+        
+        return cond
 
 
 #################################################################################
@@ -114,7 +230,7 @@ def compute_batch_iou(pred, gt, threshold=0.1):
 #################################################################################
 
 @torch.no_grad()
-def evaluate(ema, ae, diffusion, args, device, rank, epoch, logger):
+def evaluate(ema, ae, cond_encoder, diffusion, args, device, rank, epoch, logger):
     """Compute validation loss at end of epoch."""
 
     test_dataset = PredOccDataset(data_root=args.eval_data_path, split="val")
@@ -123,27 +239,32 @@ def evaluate(ema, ae, diffusion, args, device, rank, epoch, logger):
     batch = next(iter(test_loader))
 
     batch_out = preprocess_batch(batch, device=device)
-    x_video   = make_video(batch_out)           # (B, 2T, 1, H, W) in [0,1]
-    B, TT, C, H, W = x_video.shape
+    past_maps = batch_out["input_binary_maps"].float()      # (B, T, 1, H, W)
+    future_maps = batch_out["mask_binary_maps"].float()     # (B, T, 1, H, W)
+    B, TT, C, H, W = past_maps.shape
 
-    with torch.no_grad():
-        posterior = ae.encode(x_video)
-        z_frames = posterior.mode()
+    # Get input occupancy grid
+    input_occ_grid = past_maps[:, 0, :, :, :]  # (B, 1, H, W)
 
-    lat_c = z_frames.shape[1]
-    z_frames = z_frames.view(B, args.num_frames, lat_c, z_frames.shape[-2], z_frames.shape[-1])
+    # Encode future
+    posterior_future = ae.encode(future_maps)
+    future_latents = posterior_future.mode()
 
-    generator = VideoMaskGenerator((z_frames.shape[-4], z_frames.shape[-2], z_frames.shape[-1]))
-    mask = generator(B, device, idx=0)
+    lat_c = future_latents.shape[1]
+
+    # Generate conditioning map
+    cond = cond_encoder(past_maps, input_occ_grid)
+
+    # Compute loss on future frames
     t = torch.randint(0, diffusion.num_timesteps, (B,), device=device)
-    val_loss = diffusion.training_losses(ema, z_frames, t, mask=mask)["loss"].mean()
+    val_loss = diffusion.training_losses(ema, future_latents, t, model_kwargs={"cond": cond})["loss"].mean()
 
     wandb.log({"val/loss": val_loss.item()}, step=epoch)
     logger.info(f"[Epoch {epoch}] Validation Loss: {val_loss.item():.6f}")
 
 
 @torch.no_grad()
-def log_images(ema, ae, diffusion, args, device, rank, train_steps, logger):
+def log_images(ema, ae, cond_encoder, diffusion, args, device, rank, train_steps, logger):
     """Log IoU + image at training steps."""
 
     T_half = args.num_frames // 2  # 10
@@ -159,53 +280,56 @@ def log_images(ema, ae, diffusion, args, device, rank, train_steps, logger):
     t_start = perf_counter()
 
     batch_out = preprocess_batch(batch, device=device)
-    x_video   = make_video(batch_out)           # (B, 2T, 1, H, W) in [0,1]
-    B, TT, C, H, W = x_video.shape
-    x_flat = x_video.view(-1, C, H, W)          # (B*2T, 1, H, W)
+    past_maps = batch_out["input_binary_maps"].float()      # (B, T, 1, H, W)
+    future_maps = batch_out["mask_binary_maps"].float()     # (B, T, 1, H, W)
+    B, TT, C, H, W = past_maps.shape
 
-    raw_x = x_flat
-    posterior = ae.encode(x_video)
-    z_frames = posterior.mode()
-    lat_c = ae.embed_dim
-    z_frames = z_frames.view(B, args.num_frames, lat_c, z_frames.shape[-2], z_frames.shape[-1])
-    z_noise = torch.randn(B, args.num_frames, lat_c, latent_size, latent_size, device=device)
+    # Get input occupancy grid
+    input_occ_grid = past_maps[:, 0, :, :, :]  # (B, 1, H, W)
 
-    generator = VideoMaskGenerator((z_frames.shape[-4], z_frames.shape[-2], z_frames.shape[-1]))
-    mask = generator(B, device, idx=0)
-
-    z_perm  = z_noise.permute(0, 2, 1, 3, 4)
+    # Encode future
+    posterior_future = ae.encode(future_maps)
+    future_latents = posterior_future.mode()  # (B, T, lat_c, lat_h, lat_w)
+    
+    lat_c = future_latents.shape[1]
+    
+    # Generate conditioning map from past
+    cond = cond_encoder(past_maps, input_occ_grid)  # (B, 32, lat_h, lat_w)
+    
+    # Generate samples
+    z_noise = torch.randn_like(future_latents)
+    z_perm = z_noise.permute(0, 2, 1, 3, 4)  # (B, lat_c, T, lat_h, lat_w)
+    
+    # Repeat cond for all timesteps
+    cond_t = cond.unsqueeze(1).repeat(1, T_half, 1, 1, 1)  # (B, T, 32, lat_h, lat_w)
+    cond_perm = cond_t.permute(0, 2, 1, 3, 4)  # (B, 32, T, lat_h, lat_w)
 
     samples = eval_diffusion.p_sample_loop(
         ema.forward, z_perm.shape, z_perm,
         clip_denoised=False, progress=False, device=device,
-        raw_x=z_frames, mask=mask,
+        model_kwargs={"cond": cond_perm}
     )
-    samples = samples.permute(1, 0, 2, 3, 4) * mask + z_frames.permute(2, 0, 1, 3, 4) * (1 - mask)
-    samples = samples.permute(1, 2, 0, 3, 4)
+    samples = samples.permute(1, 2, 0, 3, 4)  # (B, T, lat_c, lat_h, lat_w)
     samples_flat = samples.reshape(-1, lat_c, latent_size, latent_size)
 
-    decoded = ae.decode(samples_flat) 
+    # Decode
+    decoded = ae.decode(samples_flat)
     samples = decoded.reshape(B, args.num_frames, decoded.shape[-3], decoded.shape[-2], decoded.shape[-1])
 
     # End timing
     t_end = perf_counter()
     inference_time = t_end - t_start
 
-    raw_x = raw_x.reshape(-1, args.num_frames, raw_x.shape[-3], raw_x.shape[-2], raw_x.shape[-1])
-    mask = F.interpolate(mask.float(), size=(raw_x.shape[-2], raw_x.shape[-1]), mode='nearest').unsqueeze(2)
-    raw_x = raw_x * (1 - mask)
-
-    pred_future = samples[:, T_half:]
-    gt_future = x_video[:, T_half:]
-
     # Compute frame-wise IoU
     iou_list = []
     for ti in range(T_half):
-        iou_t = compute_batch_iou(pred_future[:, ti:ti+1], gt_future[:, ti:ti+1], threshold=0.1)
+        iou_t = compute_batch_iou(samples[:, ti:ti+1], future_maps[:, ti:ti+1], threshold=0.1)
         iou_list.append(iou_t.item())
 
-    samples = torch.cat([x_video, raw_x, samples], dim=1)
-    vis = samples[0].cpu().clamp(0, 1)
+    # Visualize: past | future | predicted
+    x_video = torch.cat([past_maps, future_maps], dim=1)  # (B, 2T, 1, H, W)
+    samples_vis = torch.cat([x_video, samples], dim=1)  # (B, 3T, 1, H, W)
+    vis = samples_vis[0].cpu().clamp(0, 1)
     grid = make_grid(vis, nrow=args.num_frames, normalize=False, value_range=(0, 1))
     
     iou_text = "  ".join([f"t{ti+1}:{iou_list[ti]:.3f}" for ti in range(len(iou_list))])
@@ -286,9 +410,14 @@ def main(args):
     for p in ae.parameters():
         p.requires_grad = False
 
+    # Initialize CondEncoder
+    cond_encoder = CondEncoder(input_dim=1, hidden_dim=32)
+    cond_encoder = cond_encoder.to(device)
+    
     logger.info(f"VDT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    opt = torch.optim.AdamW(list(model.parameters()) + list(cond_encoder.parameters()), 
+                            lr=1e-4, weight_decay=0)
 
     # eval_data_path fallback
     if args.eval_data_path is None:
@@ -326,30 +455,30 @@ def main(args):
     for epoch in tqdm(range(args.epochs), desc="Epoch", disable=(rank != 0)):
         sampler.set_epoch(epoch)
         for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=(rank != 0), leave=False):
-            # Preprocess -> 1-channel video (B, T, 1, H, W)
+            # Preprocess batch
             batch_out = preprocess_batch(batch, device=device)
-            x = make_video(batch_out)  # (B, T, 1, H, W) (T=20: past 10 + future 10)
-            B, T, C, H, W = x.shape
+            past_maps = batch_out["input_binary_maps"].float()      # (B, T, 1, H, W) - original size
+            future_maps = batch_out["mask_binary_maps"].float()     # (B, T, 1, H, W)
+            B, T, C, H, W = past_maps.shape
 
-            if rank == 0:
-                log_frames = x[:T].detach().cpu()  # (2T, 1, H, W) - first sample
+            # Get input occupancy grid (first past frame)
+            input_occ_grid = past_maps[:, 0, :, :, :]  # (B, 1, H, W)
 
             with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                posterior = ae.encode(x)
-                x = posterior.mode()
+                # Encode future frames for diffusion
+                posterior_future = ae.encode(future_maps)
+                future_latents = posterior_future.mode()  # (B, T, lat_c, lat_h, lat_w)
 
-            lat_c = x.shape[1]
-            lat_h = x.shape[2]
-            lat_w = x.shape[3]
-            x = x.view(B, args.num_frames, lat_c, lat_h, lat_w)            
-            # Generation task mask each step
-            choice_idx = 0
-            generator = VideoMaskGenerator((x.shape[-4], x.shape[-2], x.shape[-1]))
-            mask = generator(B, device, idx=choice_idx)
+            lat_c = future_latents.shape[1]
+            lat_h = future_latents.shape[2]
+            lat_w = future_latents.shape[3]
 
+            # Generate conditioning map from past at original image size
+            cond = cond_encoder(past_maps, input_occ_grid)  # (B, 32, lat_h, lat_w)
+
+            # Diffusion loss on future frames only (no mask)
             t = torch.randint(0, diffusion.num_timesteps, (B,), device=device)
-            loss_dict = diffusion.training_losses(model, x, t, mask=mask)
+            loss_dict = diffusion.training_losses(model, future_latents, t, model_kwargs={"cond": cond})
             loss = loss_dict["loss"].mean()
 
             opt.zero_grad()
@@ -377,7 +506,7 @@ def main(args):
                 if rank == 0:
                     logger.info(f"Logging images at step {train_steps}...")
                     ema.eval()
-                    log_images(ema, ae, diffusion, args, device, rank, train_steps, logger)
+                    log_images(ema, ae, cond_encoder, diffusion, args, device, rank, train_steps, logger)
                     ema.train()
                 dist.barrier()
 
@@ -398,7 +527,7 @@ def main(args):
         if rank == 0:
             logger.info(f"Running epoch validation at end of epoch {epoch}...")
             ema.eval()
-            evaluate(ema, ae, diffusion, args, device, rank, epoch, logger)
+            evaluate(ema, ae, cond_encoder, diffusion, args, device, rank, epoch, logger)
             ema.train()
         dist.barrier()
 
