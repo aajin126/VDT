@@ -335,11 +335,11 @@ def log_images(ema, ae, cond_encoder, diffusion, args, device, rank, train_steps
     iou_text = "  ".join([f"t{ti+1}:{iou_list[ti]:.3f}" for ti in range(len(iou_list))])
     
     wandb.log({
-        "val/image": wandb.Image(
+        "train/image": wandb.Image(
             grid,
             caption=f"Frame-wise IoU | {iou_text}\nstep={train_steps}"
         ),
-        "val/inference_time_sec": inference_time
+        "train/inference_time_sec": inference_time
     }, step=train_steps)
     logger.info(
         f"(step={train_steps:07d}) Image logged. "
@@ -462,7 +462,8 @@ def main(args):
             B, T, C, H, W = past_maps.shape
 
             # Get input occupancy grid (first past frame)
-            input_occ_grid = past_maps[:, 0, :, :, :]  # (B, 1, H, W)
+            input_occ_grid = batch_out["input_occ_grid_map"]  # (B, H, W)
+            input_occ_grid = input_occ_grid.unsqueeze(1)  # (B, 1, H, W)
 
             with torch.no_grad():
                 # Encode future frames for diffusion
