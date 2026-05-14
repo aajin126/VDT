@@ -24,13 +24,13 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import normalized_mutual_information as nmi
 
 from models import VDT_models
-from diffusion import create_diffusion
-from mask_generator import VideoMaskGenerator
-from dataloader import PredOccDataset
-from data_preprocessing import preprocess_batch_test
+from models.diffusion import create_diffusion
+from models.mask_generator import VideoMaskGenerator
+from preprocessing.dataloader import PredOccDataset
+from preprocessing.data_preprocessing import preprocess_batch_test
 from omegaconf import OmegaConf
 
-from util import instantiate_from_config, reprojection
+from utils.util import instantiate_from_config, reprojection
 
 # Constants
 SEQ_LEN = 10
@@ -129,34 +129,6 @@ def compute_nmi_metric(pred, gt):
     
     return float(score)
 
-
-
-def make_video_3(batch_out):
-    """Convert preprocessed maps to 3-channel video tensor: (B, 2T, 3, H, W)."""
-    input_binary_maps  = batch_out["input_binary_maps"].float()   # (B, T, 1, H, W)
-    mask_binary_maps   = batch_out["mask_binary_maps"].float()    # (B, T, 1, H, W)
-    input_occ_grid_map = batch_out["input_occ_grid_map"].float()  # (B, H, W)
-    B, T, _, H, W = input_binary_maps.shape
-    static_map = input_occ_grid_map.unsqueeze(1).unsqueeze(2).expand(B, T, 1, H, W)
-
-    dynamic_past = input_binary_maps * (1.0 - static_map)
-    free_past    = 1.0 - input_binary_maps
-    past_3ch     = torch.cat([dynamic_past, static_map, free_past], dim=2)
-
-    dynamic_future = mask_binary_maps * (1.0 - static_map)
-    free_future    = 1.0 - mask_binary_maps
-    future_3ch     = torch.cat([dynamic_future, static_map, free_future], dim=2)
-
-    return torch.cat([past_3ch, future_3ch], dim=1)  # (B, 2T, 3, H, W)
-
-
-def rgb_to_binary_occupancy(frames):
-    """Convert decoded RGB occupancy frames to a single occupied probability map.
-
-    R/G channels are treated as occupied, and B is treated as unoccupied.
-    """
-    occupied = torch.clamp(frames[:, :, 0:1, :, :] + frames[:, :, 1:2, :, :], 0, 1)
-    return occupied
 
 def make_video(batch_out):
     """Convert preprocessed maps to a 1-channel video tensor: (B, 2T, 1, H, W)."""
@@ -301,6 +273,11 @@ def evaluate(model, ae, dataloader, device, output_dir, sampling_steps=10,
         if num_batches is not None and batch_idx >= num_batches:
             break
 
+        # Timing
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         batch_out = preprocess_batch_test(batch, device=device)
         x_video   = make_video(batch_out)            # (B, 2T, 3, H, W) in [0,1]
         gt_binary = batch_out["mask_binary_maps"].float()  # (B, T, 1, H, W) GT future
@@ -309,11 +286,6 @@ def evaluate(model, ae, dataloader, device, output_dir, sampling_steps=10,
         th_rel = batch_out["th_rel"]
 
         B, TT, C, H, W = x_video.shape
-
-        # Timing
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
 
         # Encode
         posterior = ae.encode(x_video)

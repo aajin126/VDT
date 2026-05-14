@@ -11,9 +11,9 @@ from taming.modules.vqvae.quantize import VectorQuantizer as VectorQuantizer
 from modules.diffusionmodules.model import Encoder, Decoder
 from modules.distributions.distributions import DiagonalGaussianDistribution
 from convlstm import ConvLSTMCell
-from data_preprocessing import preprocess_batch
+from preprocessing.data_preprocessing import preprocess_batch
 
-from util import instantiate_from_config
+from utils.util import instantiate_from_config
 
 IMG_SIZE = 64
 SEQ_LEN = 10

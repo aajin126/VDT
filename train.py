@@ -31,37 +31,14 @@ import wandb
 from torchvision.utils import make_grid
 
 from models import VDT_models
-from diffusion import create_diffusion
+from models.diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
-from mask_generator import VideoMaskGenerator
-from dataloader import PredOccDataset
-from data_preprocessing import preprocess_batch
-from autoencoder import SequenceAutoencoderKL
+from models.mask_generator import VideoMaskGenerator
+from preprocessing.dataloader import PredOccDataset
+from preprocessing.data_preprocessing import preprocess_batch
+from models.autoencoder import SequenceAutoencoderKL
 from omegaconf import OmegaConf
-from util import instantiate_from_config
-
-def make_video_3(batch_out):
-    """Convert preprocessed maps to 3-channel video tensor: (B, 2T, 3, H, W).
-    First T frames: past (input), next T frames: future (target to predict).
-    """
-    input_binary_maps  = batch_out["input_binary_maps"].float()   # (B, T, 1, H, W) - past
-    mask_binary_maps   = batch_out["mask_binary_maps"].float()    # (B, T, 1, H, W) - future
-    input_occ_grid_map = batch_out["input_occ_grid_map"].float()  # (B, H, W)
-    B, T, _, H, W = input_binary_maps.shape
-    static_map = input_occ_grid_map.unsqueeze(1).unsqueeze(2).expand(B, T, 1, H, W)  # (B, T, 1, H, W)
-
-    # Past frames (input)
-    dynamic_past = input_binary_maps * (1.0 - static_map)
-    free_past    = 1.0 - input_binary_maps
-    past_3ch     = torch.cat([dynamic_past, static_map, free_past], dim=2)   # (B, T, 3, H, W)
-
-    # Future frames (target)
-    dynamic_future = mask_binary_maps * (1.0 - static_map)
-    free_future    = 1.0 - mask_binary_maps
-    future_3ch     = torch.cat([dynamic_future, static_map, free_future], dim=2)  # (B, T, 3, H, W)
-
-    return torch.cat([past_3ch, future_3ch], dim=1)  # (B, 2T, 3, H, W)
-
+from utils.util import instantiate_from_config
 
 def make_video(batch_out):
     """Convert preprocessed maps to a 1-channel video tensor: (B, 2T, 1, H, W).
