@@ -1,0 +1,58 @@
+model:
+  base_learning_rate: 1e-4
+  target: autoencoder.SequenceAutoencoderKL 
+  params:
+    monitor: "val/total_loss"
+    embed_dim: 2
+    seq_len: 20
+    in_channels: 1
+    out_ch: 1
+    lossconfig:
+      target: aeloss.AELoss
+      params:
+        kl_weight: 0.000001
+
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 128
+    num_workers: 4
+    train:
+      target: dataloader.PredOccDataset
+      params:
+        data_root: "../data/OGM-datasets/OGM-Turtlebot2/train/"
+        split: "train"
+    validation:
+      target: dataloader.PredOccDataset
+      params:
+        data_root: "../data/OGM-datasets/OGM-Turtlebot2/val/"
+        split: "val"
+
+lightning:
+  trainer:
+    max_epochs: 50
+    check_val_every_n_epoch: 1
+    
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 50
+        max_images: 10
+        increase_log_steps: True
+
+    train_loss_epoch_checkpoint:
+      target: pytorch_lightning.callbacks.ModelCheckpoint
+      params:
+        filename: "trainloss-{epoch:06d}"
+        monitor: "train/total_loss_epoch"
+        save_top_k: -1
+        every_n_epochs: 10
+        save_last: false
+        
+  modelcheckpoint:
+    params:
+      monitor: "val/total_loss"
+      save_top_k: 10
+      save_last: true
