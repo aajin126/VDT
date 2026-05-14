@@ -128,7 +128,7 @@ def evaluate(ema, ae, diffusion, args, device, rank, epoch, logger):
 
     with torch.no_grad():
         posterior = ae.encode(x_video)
-        z_frames = posterior.mode()
+        z_frames = posterior.mode().mul_(args.scale_factor)
 
     lat_c = z_frames.shape[1]
     z_frames = z_frames.view(B, args.num_frames, lat_c, z_frames.shape[-2], z_frames.shape[-1])
@@ -165,7 +165,7 @@ def log_images(ema, ae, diffusion, args, device, rank, train_steps, logger):
 
     raw_x = x_flat
     posterior = ae.encode(x_video)
-    z_frames = posterior.mode()
+    z_frames = posterior.mode().mul_(args.scale_factor)
     lat_c = ae.embed_dim
     z_frames = z_frames.view(B, args.num_frames, lat_c, z_frames.shape[-2], z_frames.shape[-1])
     z_noise = torch.randn(B, args.num_frames, lat_c, latent_size, latent_size, device=device)
@@ -183,7 +183,9 @@ def log_images(ema, ae, diffusion, args, device, rank, train_steps, logger):
     samples = samples.permute(1, 0, 2, 3, 4) * mask + z_frames.permute(2, 0, 1, 3, 4) * (1 - mask)
     samples = samples.permute(1, 2, 0, 3, 4)
     samples_flat = samples.reshape(-1, lat_c, latent_size, latent_size)
+    samples_flat = 1. / args.scale_factor * samples_flat  
 
+    # Inverse scaling before decode
     decoded = ae.decode(samples_flat) 
     samples = decoded.reshape(B, args.num_frames, decoded.shape[-3], decoded.shape[-2], decoded.shape[-1])
 
@@ -337,7 +339,7 @@ def main(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 posterior = ae.encode(x)
-                x = posterior.mode()
+                x = posterior.mode().mul_(args.scale_factor)
 
             lat_c = x.shape[1]
             lat_h = x.shape[2]
@@ -427,6 +429,7 @@ if __name__ == "__main__":
                         help="Path to test dataset. Defaults to --data-path if not set.")
     parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--eval-sampling-steps", type=int, default=10)
+    parser.add_argument("--scale-factor", type=float, default=0.374106)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--ckpt-every", type=int, default=5000)
     args = parser.parse_args()
