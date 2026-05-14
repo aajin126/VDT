@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from utils.local_occ_grid_map import LocalMap
-from dataloader import PredOccDataset
+from preprocessing.dataloader import PredOccDataset
 
 POINTS = 1080   # number of lidar points
 IMG_SIZE = 64

@@ -10,7 +10,7 @@ from taming.modules.vqvae.quantize import VectorQuantizer as VectorQuantizer
 
 from modules.diffusionmodules.model import Encoder, Decoder
 from modules.distributions.distributions import DiagonalGaussianDistribution
-from convlstm import ConvLSTMCell
+from models.convlstm import ConvLSTMCell
 from preprocessing.data_preprocessing import preprocess_batch
 
 from utils.util import instantiate_from_config

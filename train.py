@@ -22,23 +22,22 @@ from collections import OrderedDict
 from PIL import Image
 from copy import deepcopy
 from glob import glob
-from time import time
+from time import time, perf_counter
 import argparse
 import logging
 import os
 
 import wandb
 from torchvision.utils import make_grid
+from tqdm import tqdm
 
-from models import VDT_models
+from models.models import VDT_models
 from models.diffusion import create_diffusion
-from diffusers.models import AutoencoderKL
 from models.mask_generator import VideoMaskGenerator
 from preprocessing.dataloader import PredOccDataset
 from preprocessing.data_preprocessing import preprocess_batch
-from models.autoencoder import SequenceAutoencoderKL
 from omegaconf import OmegaConf
-from utils.util import instantiate_from_config
+from utils.util import instantiate_from_config 
 
 def make_video(batch_out):
     """Convert preprocessed maps to a 1-channel video tensor: (B, 2T, 1, H, W).
@@ -115,8 +114,37 @@ def compute_batch_iou(pred, gt, threshold=0.1):
 #################################################################################
 
 @torch.no_grad()
-def evaluate(ema, ae, diffusion, args, device, rank, train_steps, logger):
-    """Run 'predict' task on one test batch, compute per-frame IoU, log GT vs Gen."""
+def evaluate(ema, ae, diffusion, args, device, rank, epoch, logger):
+    """Compute validation loss at end of epoch."""
+
+    test_dataset = PredOccDataset(data_root=args.eval_data_path, split="val")
+    test_loader  = DataLoader(test_dataset, batch_size=args.eval_batch_size,
+                              shuffle=True, num_workers=2, drop_last=True)
+    batch = next(iter(test_loader))
+
+    batch_out = preprocess_batch(batch, device=device)
+    x_video   = make_video(batch_out)           # (B, 2T, 1, H, W) in [0,1]
+    B, TT, C, H, W = x_video.shape
+
+    with torch.no_grad():
+        posterior = ae.encode(x_video)
+        z_frames = posterior.mode()
+
+    lat_c = z_frames.shape[1]
+    z_frames = z_frames.view(B, args.num_frames, lat_c, z_frames.shape[-2], z_frames.shape[-1])
+
+    generator = VideoMaskGenerator((z_frames.shape[-4], z_frames.shape[-2], z_frames.shape[-1]))
+    mask = generator(B, device, idx=0)
+    t = torch.randint(0, diffusion.num_timesteps, (B,), device=device)
+    val_loss = diffusion.training_losses(ema, z_frames, t, mask=mask)["loss"].mean()
+
+    wandb.log({"val/loss": val_loss.item()}, step=epoch)
+    logger.info(f"[Epoch {epoch}] Validation Loss: {val_loss.item():.6f}")
+
+
+@torch.no_grad()
+def log_images(ema, ae, diffusion, args, device, rank, train_steps, logger):
+    """Log IoU + image at training steps."""
 
     T_half = args.num_frames // 2  # 10
     latent_size = args.image_size // 4
@@ -127,43 +155,41 @@ def evaluate(ema, ae, diffusion, args, device, rank, train_steps, logger):
                               shuffle=True, num_workers=2, drop_last=True)
     batch = next(iter(test_loader))
 
+    # Start timing
+    t_start = perf_counter()
+
     batch_out = preprocess_batch(batch, device=device)
     x_video   = make_video(batch_out)           # (B, 2T, 1, H, W) in [0,1]
     B, TT, C, H, W = x_video.shape
     x_flat = x_video.view(-1, C, H, W)          # (B*2T, 1, H, W)
 
     raw_x = x_flat
-    # Encode all frames
-    #z_frames = vae.encode(x_flat).latent_dist.sample().mul_(0.18215)
     posterior = ae.encode(x_video)
     z_frames = posterior.mode()
     lat_c = ae.embed_dim
-    z_frames = z_frames.view(B, args.num_frames, lat_c, z_frames.shape[-2], z_frames.shape[-1])  # (B, 2T, 4, lat_h, lat_w)
+    z_frames = z_frames.view(B, args.num_frames, lat_c, z_frames.shape[-2], z_frames.shape[-1])
     z_noise = torch.randn(B, args.num_frames, lat_c, latent_size, latent_size, device=device)
 
-    # 'predict' mask: mask out future T frames
     generator = VideoMaskGenerator((z_frames.shape[-4], z_frames.shape[-2], z_frames.shape[-1]))
-    mask = generator(B, device, idx=0)  # idx=0 -> predict
-    t = torch.randint(0, diffusion.num_timesteps, (B,), device=device)
-    val_loss = diffusion.training_losses(ema, z_frames, t, mask=mask)["loss"].mean()
+    mask = generator(B, device, idx=0)
 
-    z_perm  = z_noise.permute(0, 2, 1, 3, 4)  # (B, 4, 2T, lat_h, lat_w)
+    z_perm  = z_noise.permute(0, 2, 1, 3, 4)
 
     samples = eval_diffusion.p_sample_loop(
         ema.forward, z_perm.shape, z_perm,
-        clip_denoised=False, progress=True, device=device,
+        clip_denoised=False, progress=False, device=device,
         raw_x=z_frames, mask=mask,
     )
-    # samples: (4, B, 2T, lat_h, lat_w)
     samples = samples.permute(1, 0, 2, 3, 4) * mask + z_frames.permute(2, 0, 1, 3, 4) * (1 - mask)
-    samples = samples.permute(1, 2, 0, 3, 4)  # (B, 2T, 4, lat_h, lat_w)
-    samples_flat = samples.reshape(-1, lat_c, latent_size, latent_size)  # (B*2T, 4, ...)
-    
-
-    # Decode
+    samples = samples.permute(1, 2, 0, 3, 4)
+    samples_flat = samples.reshape(-1, lat_c, latent_size, latent_size)
 
     decoded = ae.decode(samples_flat) 
     samples = decoded.reshape(B, args.num_frames, decoded.shape[-3], decoded.shape[-2], decoded.shape[-1])
+
+    # End timing
+    t_end = perf_counter()
+    inference_time = t_end - t_start
 
     raw_x = raw_x.reshape(-1, args.num_frames, raw_x.shape[-3], raw_x.shape[-2], raw_x.shape[-1])
     mask = F.interpolate(mask.float(), size=(raw_x.shape[-2], raw_x.shape[-1]), mode='nearest').unsqueeze(2)
@@ -171,24 +197,29 @@ def evaluate(ema, ae, diffusion, args, device, rank, train_steps, logger):
 
     pred_future = samples[:, T_half:]
     gt_future = x_video[:, T_half:]
-    val_iou = compute_batch_iou(pred_future, gt_future)
+
+    # Compute frame-wise IoU
+    iou_list = []
+    for ti in range(T_half):
+        iou_t = compute_batch_iou(pred_future[:, ti:ti+1], gt_future[:, ti:ti+1], threshold=0.1)
+        iou_list.append(iou_t.item())
 
     samples = torch.cat([x_video, raw_x, samples], dim=1)
-
     vis = samples[0].cpu().clamp(0, 1)
-    
     grid = make_grid(vis, nrow=args.num_frames, normalize=False, value_range=(0, 1))
+    
+    iou_text = "  ".join([f"t{ti+1}:{iou_list[ti]:.3f}" for ti in range(len(iou_list))])
+    
     wandb.log({
-        "val/loss": val_loss.item(),
-        "val/iou": val_iou.item(),
-        "eval/generated": wandb.Image(
+        "val/image": wandb.Image(
             grid,
-            caption=f"Top: GT  Middle: input  Bottom: generated  step={train_steps}"
-        )
+            caption=f"Frame-wise IoU | {iou_text}\nstep={train_steps}"
+        ),
+        "val/inference_time_sec": inference_time
     }, step=train_steps)
     logger.info(
-        f"(step={train_steps:07d}) Validation logged to wandb. "
-        f"loss={val_loss.item():.6f}, iou={val_iou.item():.4f}"
+        f"(step={train_steps:07d}) Image logged. "
+        f"inference_time={inference_time:.2f}s, {iou_text}"
     )
  
 #################################################################################
@@ -290,14 +321,11 @@ def main(args):
     train_steps  = 0
     log_steps    = 0
     running_loss = 0
-    start_time   = time()
-    num_tasks    = 7  # VideoMaskGenerator task idx 0~6
 
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
+    for epoch in tqdm(range(args.epochs), desc="Epoch", disable=(rank != 0)):
         sampler.set_epoch(epoch)
-        logger.info(f"Beginning epoch {epoch}...")
-        for batch in loader:
+        for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=(rank != 0), leave=False):
             # Preprocess -> 1-channel video (B, T, 1, H, W)
             batch_out = preprocess_batch(batch, device=device)
             x = make_video(batch_out)  # (B, T, 1, H, W) (T=20: past 10 + future 10)
@@ -308,9 +336,9 @@ def main(args):
 
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
-                #x = ae.encode(x).latent_dist.sample().mul_(0.18215) # (B*T, 1, H, W)
                 posterior = ae.encode(x)
                 x = posterior.mode()
+
             lat_c = x.shape[1]
             lat_h = x.shape[2]
             lat_w = x.shape[3]
@@ -324,11 +352,6 @@ def main(args):
             loss_dict = diffusion.training_losses(model, x, t, mask=mask)
             loss = loss_dict["loss"].mean()
 
-            # t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            # model_kwargs = dict(y=y)
-            # loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            # loss = loss_dict["loss"].mean()
-
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -340,25 +363,22 @@ def main(args):
 
             if train_steps % args.log_every == 0:
                 torch.cuda.synchronize()
-                end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}")
                 if rank == 0:
-                    wandb.log({"train/loss": avg_loss, "train/steps_per_sec": steps_per_sec}, step=train_steps)
+                    wandb.log({"train/loss": avg_loss}, step=train_steps)
                 running_loss = 0
                 log_steps    = 0
-                start_time   = time()
 
-            if train_steps % args.eval_every == 0 and train_steps > 0:
+            if train_steps % 100 == 0 and train_steps > 0:
                 if rank == 0:
-                    logger.info(f"Running evaluation at step {train_steps}...")
+                    logger.info(f"Logging images at step {train_steps}...")
                     ema.eval()
-                    evaluate(ema, ae, diffusion, args, device, rank, train_steps, logger)
-                    ema.eval()  # keep ema in eval mode
+                    log_images(ema, ae, diffusion, args, device, rank, train_steps, logger)
+                    ema.train()
                 dist.barrier()
 
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
@@ -373,6 +393,14 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
+
+        # End of epoch: evaluate loss only
+        if rank == 0:
+            logger.info(f"Running epoch validation at end of epoch {epoch}...")
+            ema.eval()
+            evaluate(ema, ae, diffusion, args, device, rank, epoch, logger)
+            ema.train()
+        dist.barrier()
 
     model.eval()
     logger.info("Done!")
